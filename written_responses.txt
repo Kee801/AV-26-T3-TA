@@ -1,20 +1,282 @@
 ### Part A - recover the data (CAN decode)
 
-Frame ID kept:
+Frame ID kept: 512 (0x200)
 
-Signal 1 (u_commanded):  byte position / endianness / signed? / scale / offset:
-Signal 2 (y_measured):   byte position / endianness / signed? / scale / offset:
+Signal 1 (u_commanded):  byte position: 16 / endianness: little-endian/ signed?: signed / scale: 0.1 / offset: 0
+Signal 2 (y_measured):   byte position: 0 / endianness: little-endian / signed?: signed / scale: 0.1 / offset: 0
 
 Notes (anything odd in the logs, how you checked the decode against the PNGs):
 
+I am going to log all of my work below.
+20/9/2026 & 21/9/2026
 
+CAN SIGNAL EXTRACTION
+information required: Byte order, Bit start, Bit length, Offset, Scale
+We use a dbc file to decode raw CAN bus data to physical values.
+
+UNDERSTANDING DBC DATA
+
+BO_ defines a CAN message
+SG_ defines a signal inside the CAN message
+
+
+example: SG_ MeasuredAngle : 0|16@1- (0.1,0) [0|0] "deg" Vector__XXX
+start bit = 0
+signal length = 16 bits
+endianness = 1 / 0
+signedness = - / +
+(0.1, 0) means physical_value = raw_value x 0.1 + 0
+
+ENDIANNESS:
+if endianness is 1, it is little-endian where the lower order byte comes first
+                 0, it is Motorola where the higher order byte comes first 
+
+SIGNDNESS:
+if +  it is unsigned, if - it is signed
+UNDERSTANDING CAN DATA
+
+format of the data is candump
+
+example: (1705638751.000000) vcan0 200#00001400852FB01D
+(1705638751.000000) - this is timestamp
+vcan0 - interface 
+200#00001400852FB01D - CAN frame
+0x200 - CAN ID
+00001400852FB01D - CAN data
+
+BIT NUMBERING
+00001400852FB01D - 00 00 14 00 85 2F B0 1D
+convert each byte to bits and then reverse number.
+example: 14 - 0  0  0  1  0  1  0  0
+              23 22 21 20 19 18 17 16 
+
+USING MANUAL SHIFTING CASE SIGNAL BIT
+
+Case 1: Start 0, length 16 -> it will occupy bits 0 to 15 which is byte 0, byte 1
+raw = data[0] | (data[1] << 8);
+physical value = raw × factor + offset
+
+Case 2: Start 16, length 16 -> it will occupy bits 16 to 31 which is byte 2, byte 3
+raw = data[2] | (data[3] << 8);
+physical value = raw × factor + offset
+
+WE KEEP DOING THIS FOR ALL CASES
+
+I have to make the program read the dbc file rather than hardcoding. For that i am going to use various reference characters and substring to get variables like 
+starting bit, signal length, offset, factor.
+
+I am having difficulty in doing the manual shifting case when its not hardcoded, i learnt something called masking which creates a binary number
+with the length of signal length
+
+int mask = (1<<signalLength) - 1
+
+to find out where inside the starting byte does the signal begin we do startingBit % 8
+
+Big Endian - The big end is placed first
+Little Endian - the little end is placed first
+
+unsigned + -> no conversion needed
+signed - -> if sign bit = 0: signed value = raw value 
+            if sign bit = 1: signed vlue = unsigned value - 2^number_of_bits
+
+
+
+ALGORITHM
+1 - load log file
+2 - read log file line by line
+3 - extract timestamp, interface, frame, CAN id, CAN data
+4 - store can data respectively in bytes array
+5 - load dbc file
+6 - read dbc file line by line
+7 - Find BO_ and extract DBC message ID
+8 - Compare DBC message ID and CAN id, make sure it is equal and then start extraction of data from dbc file
+9 - Find SG_
+10 - extract signal name, starting bit, signal length, endian, sign, factor and offset
+11 - if little endian pack then LSB -> MSB
+12 - if big endian then MSB -> LSB
+13 - if signed (-) then signed value = unsigned value - 2^number_of_bits
+14 - apply scale and offset to get physical value
+15 - form rows
+
+Error that i made, i did not save the timestamp correctly, i just saved the numbers between the closed parenthesis. But for the csv i have to get elapsed time
+Another error, i created a row object for every CAN frame, i have to make a row only if CAN ID exists in DBC
+
+To verify the decoding, i plotted the 3 generated csv files and compared it with the plots given in the question.
 
 ### Part B - identify system
+22/09/2026 and 23/09/2026
 
+1 - ANALYSIS OF STEP_TEST
+
+There is a lag in the increase of Measured angle at the start of constant angular rate 15.0 deg/s(CmdAngularRate). 
+Measured angle stays 0 till 0.19 timestamp and then linearly increases till 56.1 degrees after which it remains constant as the angular rate is dropped to 0.
+Measured angle reaches 56.1 degrees at timestamp 3.245, it is at the 3.005 timestamp that the CmdAngularRate is stopped and made 0 and the graph continuos rising for another 0.24s.
+
+There is a lag once CmdAngularRate stops as well. CmdAngularRate becomes 0 at timestamp 3.005, at this time measured angle is 54.8.
+The measured angle becomes constant from timestamp 3.245 with the value 56.1 
+let plant gain = P 
+
+P = measured rate(angular rate)/commanded rate
+
+measured rate(angular rate) = average slope = (54.6 - 1)/(2.995 - 0.24) = 19.456
+commanded rate = 15.0
+
+P = 1.297 which is approximately 1.3
+
+time constant = extra distance traveled after stopping / speed it was going right before stopping (avg slope)
+              = 1.3 / 19.5 = 0.067s
+
+2 - Analysis of DEADBAND_TEST
+
+Honetly, I am not entirely sure of what non-linearity is shown in this test but i am inclined to saying that it is a backlash.
+
+A deadzone is a range of input where nothing happens until you cross a threshold. 
+A backlash is like slacking, there is a delay whenever you change directions.
+
+There is a bit of lag at the start after which the y_measured increases linearly till 2.6 when u_commanded drops down to -2.
+After this, no matter the change in u_commanded, there is no change in y_measured. 
+MeasuredAngle does not immediately begin decreasing, it remains constant for a period of time. This is consistent with backlash
+
+Backlash width = |commanded rate| x (dead time after reversal)
+1) dead time from rest - B (one side) = 2 * 1.05 = 2.1 degrees
+2) since there is no reversal in y_measured lower bound = 2 * half period = 4 degrees.
+
+backlash width = approx 4 degrees.
+
+3 -  Analysis of reveral_test
+This graph shows backlash. It is pretty evident by looking at the graph that when the commanded velocity reverses, the measured angle
+doesnt immediately reverse. Instead, the measured angle remains flat for sometime before switching directions.
+This is mechanical slack and this is a characteristic of backlash.
+
+Plant.hpp:
+from testing between value i found that backlash width of 5.0 sits on the data graph closer.
+This is because the backlash works on the scaled value, we do plant_gain * u_cmd.
 
 
 ### Part C - control design choices
 
+Setpoint(reference) and measurement.
+Error term = Setpoint - measurement
 
+
+error term (e) is passed through the controller to get the control signal (u)
+
+Integral -> remembers past errors
+Integral Windup -> when you approach the target but the accumulated integral error causes the controller to overshoot
+
+Anti-windup -> Don't allow the integral term to keep growing when the controller is already saturated
+Clamp the values using clamp()
+
+Derivative -> looks at how quickly the error is changing
+
+OUTPUTS WITH CONFIGURATION (Adjusting Kp)
+Kp = 1.0, Ki = 0.01, Kd = 0.0
+  large move       target= 20.00  end= 20.10 (err +0.10)  overshoot=0.10 deg  settled by t=5.99s into phase
+  reversal         target= 12.00  end= 12.00 (err +0.00)  overshoot=0.00 deg  settled by t=4.01s into phase
+  on-centre trim   target= 13.50  end= 13.30 (err -0.20)  overshoot=0.00 deg  settled by t=3.99s into phase
+
+Kp = 1.2, Ki = 0.01, Kd = 0.0
+  large move       target= 20.00  end= 20.10 (err +0.10)  overshoot=0.10 deg  settled by t=5.99s into phase
+  reversal         target= 12.00  end= 12.00 (err +0.00)  overshoot=0.00 deg  settled by t=3.43s into phase
+  on-centre trim   target= 13.50  end= 13.50 (err +0.00)  overshoot=0.00 deg  settled by t=3.31s into phase
+
+Kp = 2.0, Ki = 0.01, Kd = 0.0
+  large move       target= 20.00  end= 20.10 (err +0.10)  overshoot=0.10 deg  settled by t=5.99s into phase
+  reversal         target= 12.00  end= 12.00 (err +0.00)  overshoot=0.00 deg  settled by t=1.91s into phase
+  on-centre trim   target= 13.50  end= 13.60 (err +0.10)  overshoot=0.10 deg  settled by t=3.99s into phase
+
+Goal is to increase Kp as much as possible to get higher gain without overshoot
+final Kp is 1.5
+
+OUTPUTS WITH CONFIGURATION (Adjusting Kp)
+Kp = 1.5, Ki = 0.01, Kd = 0.0
+CHECK 2 -- controller.hpp against plant.hpp (move -> reversal -> small trim)
+  large move       target= 20.00  end= 20.10 (err +0.10)  overshoot=0.10 deg  settled by t=5.99s into phase
+  reversal         target= 12.00  end= 12.00 (err +0.00)  overshoot=0.00 deg  settled by t=2.74s into phase
+  on-centre trim   target= 13.50  end= 13.50 (err +0.00)  overshoot=0.00 deg  settled by t=2.61s into phase
+
+Kp = 1.5, Ki = 0.02, Kd = 0.0
+CHECK 2 -- controller.hpp against plant.hpp (move -> reversal -> small trim)
+  large move       target= 20.00  end= 20.20 (err +0.20)  overshoot=0.20 deg  settled by t=5.99s into phase
+  reversal         target= 12.00  end= 12.00 (err +0.00)  overshoot=0.00 deg  settled by t=2.95s into phase
+  on-centre trim   target= 13.50  end= 13.60 (err +0.10)  overshoot=0.10 deg  settled by t=3.99s into phase
+Error doubled, Reversal became slower, Trim became slower
+
+Kp = 1.5, Ki = 0.005, Kd = 0.0
+CHECK 2 -- controller.hpp against plant.hpp (move -> reversal -> small trim)
+  large move       target= 20.00  end= 20.10 (err +0.10)  overshoot=0.10 deg  settled by t=5.99s into phase
+  reversal         target= 12.00  end= 12.00 (err +0.00)  overshoot=0.00 deg  settled by t=2.64s into phase
+  on-centre trim   target= 13.50  end= 13.50 (err +0.00)  overshoot=0.00 deg  settled by t=2.68s into phase
+Final Ki = 0.05
+
+OUTPUTS WITH CONFIGURATION (Adjusting Kp)
+Kp = 1.5, Ki = 0.01, Kd = 0.1
+CHECK 2 -- controller.hpp against plant.hpp (move -> reversal -> small trim)
+  large move       target= 20.00  end= 20.10 (err +0.10)  overshoot=0.10 deg  settled by t=5.99s into phase
+  reversal         target= 12.00  end= 12.00 (err +0.00)  overshoot=0.00 deg  settled by t=3.07s into phase
+  on-centre trim   target= 13.50  end= 13.50 (err +0.00)  overshoot=0.00 deg  settled by t=2.69s into phase
+Reversal is slower, Trim also slower
+
+Kp = 1.5, Ki = 0.01, Kd = 0.01
+CHECK 2 -- controller.hpp against plant.hpp (move -> reversal -> small trim)
+  large move       target= 20.00  end= 20.10 (err +0.10)  overshoot=0.10 deg  settled by t=5.99s into phase
+  reversal         target= 12.00  end= 12.00 (err +0.00)  overshoot=0.00 deg  settled by t=2.77s into phase
+  on-centre trim   target= 13.50  end= 13.50 (err +0.00)  overshoot=0.00 deg  settled by t=2.62s into phase
+still slower
+Final Kd = 0.0
+
+Final Parameters: Kp = 1.5, Ki = 0.01, Kd = 0.0
+
+TESTS WITH DIFFERENT PLANT CONFIGURATIONS
+1) only plant gain changed to 1.40 -> controller still remains stable
+2) only time_constant changed to 0.074 -> stable
+3) only backlash width to 5.5 -> stable
+
+CHECKS FOR INTEGRAL LIMIT (comparison with limit 10):
+1) 20 -> reversal gets slightly slower, trim gets very slow, trim gets +0.10 overshoot
+2) 5 -> faster reversal than 10 but 10 gives faster trim
+3) 2 -> found our best integral constant, all the overshoot and error is now 0
+
+final integral_limit = 2
 
 ### Part D - reflection
+
+1) For Part A
+I had initially assumed that all the CAN data contained 8 bytes. So, while using std::stoul(), I was getting an error.
+I then went back and checked the log and noticed the messages had fields like 13D#E4. To fix this, I did not pre-define the number of bytes
+and instead read the length directly from the CAN data in the log file.
+
+While extracting signal name, "SG_ " is 4 characters but i did SGPos + 3 which ended up in incorrect signal name being extracted.
+Changing this to SGPos+4 fixed the issue.
+
+I had created Rows for every CAN frame, even if the CAN Id was not equal to the DBC message. This messed up the plots and some CAN messages
+had outputs with zero values. I fixed this by creating a row only when the CAN ID = DBC message
+
+The timestamp was represented in the format 1705638751.000000. I had used this raw format and saved it in the timestamp variable.
+This value was also appended into the csv. This messed up the plot and I had to convert it to actual elapsed value which for example is
+0 in this case.
+
+My code went through 3 different iterations. In the 1st one i had hardcoded the values. I did not read the dbc file, i straight up 
+entered the values written in the dbc file into different variables and used that.
+The 2nd iteration dynamically read the dbc file but I forgot to take into account scenarios like different signedness and big endianness.
+In my 3rd iteration, i implemented this.
+
+An issue i majorly faced was understanding bitwise movement especially for big endianness and signedness. I was able to grasp this
+after watching a few youtube videos and writing down and learning.
+
+2) For Part B
+In this part one of the major issues i faced was understanding the deadband_test graph. I was very unsure whether it was a deadzone or
+a backlash. 
+
+With my reasoning, i was able to conclude it was backlash. The reasoning is given below:
+There is a bit of lag at the start after which the y_measured increases linearly till 2.6 when u_commanded drops down to -2.
+After this, no matter the change in u_commanded, there is no change in y_measured. 
+If it was a deadzone, there would either be movement for both + and - 2 deg/s or no movement at all.
+
+3) For Part C 
+I did not face a lot of issues in this section, it was simple PID tuning.
+I have logged each of my findings above in the Part C section.
+
+
+
+

@@ -12,14 +12,31 @@
 struct Plant {
     // add whatever state your model needs (velocity, motor-side angle, ...)
     double angle = 0.0;
+    double plant_gain = 1.30;
+    double time_constant = 0.067;
+    double backlash_width =  5;
+
+    double rate = 0;
+    double measured = 0;
 
     // u_cmd : commanded velocity, deg/s
     // dt    : timestep, seconds
     // return: measured output angle, deg
     double step(double u_cmd, double dt) {
-        angle += u_cmd * dt;                   // placeholder dynamics -- replace this
-        return std::round(angle / 0.1) * 0.1;  // the sensor reads to 0.1 deg
+
+        rate += (plant_gain * u_cmd - rate) * (dt/time_constant);
+
+        angle += rate * dt;                   // placeholder dynamics -- replace this
+        if (angle - measured > backlash_width / 2.0)
+        {
+            measured = angle - backlash_width / 2.0;
+        } 
+        else if (angle - measured < -backlash_width / 2.0) 
+        {
+            measured = angle + backlash_width / 2.0;
+        }
+        return std::round(measured / 0.1) * 0.1;  // the sensor reads to 0.1 deg
     }
 
-    void reset() { angle = 0.0; }
+    void reset() { angle = 0.0; rate = 0.0; measured = 0.0; }
 };
